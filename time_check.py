@@ -7,9 +7,11 @@ from openpyxl.styles import PatternFill
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-st.set_page_config(page_title="时间间隔缺失检测与填充", page_icon="⏱️", layout="wide")
-st.title("⏱️ 时间间隔缺失检测与填充工具")
+st.set_page_config(page_title="环境数据检测与处理", page_icon="⏱️", layout="wide")
+st.title("⏱️ 环境数据检测与处理工具")
 st.markdown("上传Excel文件，自动检测异常时间间隔，线性插值填充缺失值，查看每日统计，下载标黄结果")
 
 # ==================== 辅助函数 ====================
@@ -80,7 +82,7 @@ def analyze_and_fill(df, date_col, time_col, combined_col, value_cols, freq_minu
     datetime_series = build_datetime_series(df, date_col, time_col, combined_col)
     if datetime_series is None:
         st.error("无法识别时间列")
-        return None, None, None
+        return None, None, None, None
     df['_temp_time'] = datetime_series
     df = df.dropna(subset=['_temp_time']).reset_index(drop=True)
     df['_row_id'] = range(len(df))
@@ -98,7 +100,8 @@ def analyze_and_fill(df, date_col, time_col, combined_col, value_cols, freq_minu
     need_fill = gaps_df[gaps_df['missing_count'] > 0]
     if len(need_fill) == 0:
         df = df.drop(columns=['_temp_time', '_row_id', '_is_original'])
-        return df, gaps_df, datetime_series
+        daily_stats = calculate_daily_stats(df, date_col, combined_col, value_cols)
+        return df, gaps_df, datetime_series, daily_stats
     new_rows = []
     for _, gap in need_fill.iterrows():
         i = int(gap['index'])
@@ -138,7 +141,8 @@ def analyze_and_fill(df, date_col, time_col, combined_col, value_cols, freq_minu
     df_filled = df_filled.drop(columns=['_temp_time', '_row_id'])
     original_cols = [col for col in df.columns if col not in ['_temp_time', '_row_id', '_is_original']]
     df_filled = df_filled[original_cols + ['_is_original']]
-    return df_filled, gaps_df, datetime_series
+    daily_stats = calculate_daily_stats(df_filled, date_col, combined_col, value_cols)
+    return df_filled, gaps_df, datetime_series, daily_stats
 
 def calculate_daily_stats(df, date_col, combined_col, value_cols):
     if combined_col:
@@ -176,6 +180,34 @@ def to_excel_with_highlight(df, highlight_col='_is_original', highlight_color='F
     wb.save(output)
     output.seek(0)
     return output
+
+def create_daily_trend_image(daily_stats, value_cols, value_cols_en=None):
+    """生成每日趋势图，纵轴使用英文标签（value_cols_en），横轴为英文Date"""
+    if daily_stats is None or daily_stats.empty:
+        return None
+    if value_cols_en is None:
+        value_cols_en = value_cols
+    dates = daily_stats['_date']
+    n = len(value_cols)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 3 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+    for i, col in enumerate(value_cols):
+        ax = axes[i]
+        label = value_cols_en[i] if i < len(value_cols_en) else col
+        ax.plot(dates, daily_stats[col], marker='o', linestyle='-', color=f'C{i}')
+        ax.set_ylabel(label)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    axes[-1].set_xlabel('Date')
+    fig.autofmt_xdate(rotation=30)
+    plt.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format='png', dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 # ==================== 颜色预设 ====================
 COLOR_PRESETS = {
@@ -252,7 +284,9 @@ else:
     
     if value_cols:
         with st.spinner("正在分析..."):
-            df_filled, gaps_df, datetime_series = analyze_and_fill(df_original.copy(), date_col, time_col, combined_col, value_cols, freq_minutes)
+            df_filled, gaps_df, datetime_series, daily_stats = analyze_and_fill(
+                df_original.copy(), date_col, time_col, combined_col, value_cols, freq_minutes
+            )
         
         if df_filled is not None and gaps_df is not None:
             normal_mask = (gaps_df['delta'] >= freq_minutes - 1) & (gaps_df['delta'] <= freq_minutes + 1)
@@ -325,8 +359,10 @@ else:
             
             with tab4:
                 st.subheader("📈 每日特征均值")
-                daily_stats = calculate_daily_stats(df_filled, date_col, combined_col, value_cols)
                 if daily_stats is not None:
+                    st.session_state['daily_stats'] = daily_stats
+                    st.session_state['value_cols'] = value_cols
+                    
                     min_date = daily_stats['_date'].min()
                     max_date = daily_stats['_date'].max()
                     date_range = st.date_input("选择日期范围", value=(min_date, max_date), min_value=min_date, max_value=max_date)
@@ -355,6 +391,48 @@ else:
                 st.download_button("📥 下载Excel（标色）", data=excel_data, file_name="时间数据_已填充.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
                 csv_data = df_filled.to_csv(index=False).encode('utf-8-sig')
                 st.download_button("📥 下载CSV", data=csv_data, file_name="时间数据_已填充.csv", mime="text/csv", use_container_width=True)
+                
+                # 每日趋势图下载（英文标签）
+                st.markdown("---")
+                st.subheader("📈 每日趋势图下载")
+                if 'daily_stats' in st.session_state and 'value_cols' in st.session_state:
+                    daily_stats_s = st.session_state['daily_stats']
+                    value_cols_s = st.session_state['value_cols']
+                    
+                    # 中文到英文的映射
+                    CN_TO_EN = {
+                        '空气温度': 'Air Temperature',
+                        '空气湿度': 'Air Humidity',
+                        '光照度': 'Light Intensity',
+                        'CO2浓度': 'CO2 Concentration',
+                        '温度': 'Temperature',
+                        '湿度': 'Humidity',
+                        '光照': 'Light',
+                        'CO2': 'CO2',
+                        '二氧化碳': 'CO2',
+                    }
+                    value_cols_en = []
+                    for col in value_cols_s:
+                        if col in CN_TO_EN:
+                            value_cols_en.append(CN_TO_EN[col])
+                        else:
+                            # 部分匹配
+                            matched = False
+                            for cn, en in CN_TO_EN.items():
+                                if cn in col:
+                                    value_cols_en.append(en)
+                                    matched = True
+                                    break
+                            if not matched:
+                                value_cols_en.append(f'Variable {value_cols_s.index(col)+1}')
+                    
+                    img_buf = create_daily_trend_image(daily_stats_s, value_cols_s, value_cols_en)
+                    if img_buf is not None:
+                        st.download_button("📥 下载每日趋势图（PNG）", data=img_buf, file_name="每日趋势图.png", mime="image/png", use_container_width=True)
+                    else:
+                        st.warning("无法生成趋势图")
+                else:
+                    st.warning("请先在“每日统计”标签页中生成数据")
         else:
             st.error("分析失败，请检查配置")
     else:
